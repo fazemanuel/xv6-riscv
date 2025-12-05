@@ -1,3 +1,13 @@
+/*
+ * kernel/proc.c - Gestión de Procesos y Planificador de CPU
+ * 
+ * FUNCIONES PRINCIPALES:
+ * - Creación/destrucción de procesos (allocproc, freeproc, fork, exit)
+ * - Planificador Round-Robin (scheduler)
+ * - Context switching (sched, yield)
+ * - Sincronización (sleep, wakeup)
+ */
+
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -6,12 +16,16 @@
 #include "proc.h"
 #include "defs.h"
 
+// Arreglo global de todas las CPUs
 struct cpu cpus[NCPU];
 
+// Tabla de procesos (máximo 64 procesos)
 struct proc proc[NPROC];
 
+// Puntero al proceso init (primer proceso de usuario)
 struct proc *initproc;
 
+// Contador para asignar PIDs únicos
 int nextpid = 1;
 struct spinlock pid_lock;
 
@@ -20,30 +34,26 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
-// helps ensure that wakeups of wait()ing
-// parents are not lost. helps obey the
-// memory model when using p->parent.
-// must be acquired before any p->lock.
+// Lock para sincronización entre padres e hijos en wait/exit
 struct spinlock wait_lock;
 
-// Allocate a page for each process's kernel stack.
-// Map it high in memory, followed by an invalid
-// guard page.
+// proc_mapstacks() - Mapea las pilas del kernel para cada proceso
+// Cada proceso necesita su propia pila cuando ejecuta en modo kernel
 void
 proc_mapstacks(pagetable_t kpgtbl)
 {
   struct proc *p;
   
   for(p = proc; p < &proc[NPROC]; p++) {
-    char *pa = kalloc();
+    char *pa = kalloc();  // Asignar página física de 4KB
     if(pa == 0)
       panic("kalloc");
-    uint64 va = KSTACK((int) (p - proc));
+    uint64 va = KSTACK((int) (p - proc));  // Dirección virtual del stack
     kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
   }
 }
 
-// initialize the proc table.
+// procinit() - Inicializa la tabla de procesos al arrancar
 void
 procinit(void)
 {
@@ -51,16 +61,16 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-      p->state = UNUSED;
+      p->state = UNUSED;  // Todos los slots inicialmente libres
       p->kstack = KSTACK((int) (p - proc));
   }
 }
 
-// Must be called with interrupts disabled,
-// to prevent race with process being moved
-// to a different CPU.
+// cpuid() - Retorna el ID de la CPU actual
+// PRECONDICIÓN: interrupciones deshabilitadas
 int
 cpuid()
 {
@@ -68,8 +78,7 @@ cpuid()
   return id;
 }
 
-// Return this CPU's cpu struct.
-// Interrupts must be disabled.
+// mycpu() - Retorna el descriptor de la CPU actual
 struct cpu*
 mycpu(void)
 {
@@ -78,7 +87,7 @@ mycpu(void)
   return c;
 }
 
-// Return the current struct proc *, or zero if none.
+// myproc() - Retorna el proceso ejecutando en esta CPU
 struct proc*
 myproc(void)
 {
@@ -89,6 +98,7 @@ myproc(void)
   return p;
 }
 
+// allocpid() - Asigna un PID único
 int
 allocpid()
 {
@@ -102,15 +112,14 @@ allocpid()
   return pid;
 }
 
-// Look in the process table for an UNUSED proc.
-// If found, initialize state required to run in the kernel,
-// and return with p->lock held.
-// If there are no free procs, or a memory allocation fails, return 0.
+// allocproc() - Busca un slot UNUSED y prepara un nuevo proceso
+// RETORNA: puntero al proceso con p->lock held, o NULL si falla
 static struct proc*
 allocproc(void)
 {
   struct proc *p;
 
+  // Buscar slot libre
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
@@ -125,14 +134,14 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
-  // Allocate a trapframe page.
+  // Alocar trapframe (guarda registros de usuario)
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // An empty user page table.
+  // Crear tabla de páginas vacía
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
     freeproc(p);
@@ -140,8 +149,7 @@ found:
     return 0;
   }
 
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
+  // Configurar contexto inicial para que empiece en forkret()
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
@@ -149,9 +157,8 @@ found:
   return p;
 }
 
-// free a proc structure and the data hanging from it,
-// including user pages.
-// p->lock must be held.
+// freeproc() - Libera todos los recursos de un proceso
+// PRECONDICIÓN: p->lock held
 static void
 freeproc(struct proc *p)
 {
@@ -171,30 +178,24 @@ freeproc(struct proc *p)
   p->state = UNUSED;
 }
 
-// Create a user page table for a given process, with no user memory,
-// but with trampoline and trapframe pages.
+// proc_pagetable() - Crea tabla de páginas con trampoline y trapframe
 pagetable_t
 proc_pagetable(struct proc *p)
 {
   pagetable_t pagetable;
 
-  // An empty page table.
   pagetable = uvmcreate();
   if(pagetable == 0)
     return 0;
 
-  // map the trampoline code (for system call return)
-  // at the highest user virtual address.
-  // only the supervisor uses it, on the way
-  // to/from user space, so not PTE_U.
+  // Mapear trampoline (código para transiciones user↔kernel)
   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
               (uint64)trampoline, PTE_R | PTE_X) < 0){
     uvmfree(pagetable, 0);
     return 0;
   }
 
-  // map the trapframe page just below the trampoline page, for
-  // trampoline.S.
+  // Mapear trapframe (página para guardar registros)
   if(mappages(pagetable, TRAPFRAME, PGSIZE,
               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
@@ -205,8 +206,7 @@ proc_pagetable(struct proc *p)
   return pagetable;
 }
 
-// Free a process's page table, and free the
-// physical memory it refers to.
+// proc_freepagetable() - Libera tabla de páginas de usuario
 void
 proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
@@ -215,7 +215,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
-// Set up first user process.
+// userinit() - Crea el primer proceso de usuario (init)
 void
 userinit(void)
 {
@@ -225,14 +225,13 @@ userinit(void)
   initproc = p;
   
   p->cwd = namei("/");
-
   p->state = RUNNABLE;
 
   release(&p->lock);
 }
 
-// Grow or shrink user memory by n bytes.
-// Return 0 on success, -1 on failure.
+// growproc() - Aumenta o reduce memoria de usuario
+// n > 0: crecer | n < 0: reducir
 int
 growproc(int n)
 {
@@ -254,8 +253,8 @@ growproc(int n)
   return 0;
 }
 
-// Create a new process, copying the parent.
-// Sets up child kernel stack to return as if from fork() system call.
+// kfork() - Crea proceso hijo (copia del padre)
+// RETORNA: PID del hijo en el padre, 0 en el hijo
 int
 kfork(void)
 {
@@ -263,12 +262,12 @@ kfork(void)
   struct proc *np;
   struct proc *p = myproc();
 
-  // Allocate process.
+  // Alocar nuevo proceso
   if((np = allocproc()) == 0){
     return -1;
   }
 
-  // Copy user memory from parent to child.
+  // Copiar memoria de usuario del padre al hijo
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
@@ -276,13 +275,13 @@ kfork(void)
   }
   np->sz = p->sz;
 
-  // copy saved user registers.
+  // Copiar registros guardados
   *(np->trapframe) = *(p->trapframe);
 
-  // Cause fork to return 0 in the child.
+  // Hacer que fork() retorne 0 en el hijo
   np->trapframe->a0 = 0;
 
-  // increment reference counts on open file descriptors.
+  // Duplicar file descriptors
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
@@ -294,10 +293,12 @@ kfork(void)
 
   release(&np->lock);
 
+  // Establecer relación padre-hijo
   acquire(&wait_lock);
   np->parent = p;
   release(&wait_lock);
 
+  // Marcar como ejecutable
   acquire(&np->lock);
   np->state = RUNNABLE;
   release(&np->lock);
@@ -305,8 +306,7 @@ kfork(void)
   return pid;
 }
 
-// Pass p's abandoned children to init.
-// Caller must hold wait_lock.
+// reparent() - Reasigna hijos huérfanos a init
 void
 reparent(struct proc *p)
 {
@@ -319,10 +319,8 @@ reparent(struct proc *p)
     }
   }
 }
-
-// Exit the current process.  Does not return.
-// An exited process remains in the zombie state
-// until its parent calls wait().
+// kexit() - Termina el proceso actual (NUNCA RETORNA)
+// El proceso queda en estado ZOMBIE hasta que el padre llame wait()
 void
 kexit(int status)
 {
@@ -331,7 +329,7 @@ kexit(int status)
   if(p == initproc)
     panic("init exiting");
 
-  // Close all open files.
+  // Cerrar todos los archivos abiertos
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
       struct file *f = p->ofile[fd];
@@ -347,26 +345,26 @@ kexit(int status)
 
   acquire(&wait_lock);
 
-  // Give any children to init.
+  // Reasignar hijos a init
   reparent(p);
 
-  // Parent might be sleeping in wait().
+  // Despertar al padre que podría estar en wait()
   wakeup(p->parent);
   
   acquire(&p->lock);
 
   p->xstate = status;
-  p->state = ZOMBIE;
+  p->state = ZOMBIE;  // Marcar como zombie
 
   release(&wait_lock);
 
-  // Jump into the scheduler, never to return.
+  // Saltar al scheduler y nunca retornar
   sched();
   panic("zombie exit");
 }
 
-// Wait for a child process to exit and return its pid.
-// Return -1 if this process has no children.
+// kwait() - Espera a que un hijo termine
+// RETORNA: PID del hijo, o -1 si no hay hijos
 int
 kwait(uint64 addr)
 {
@@ -377,16 +375,15 @@ kwait(uint64 addr)
   acquire(&wait_lock);
 
   for(;;){
-    // Scan through table looking for exited children.
+    // Buscar hijos
     havekids = 0;
     for(pp = proc; pp < &proc[NPROC]; pp++){
       if(pp->parent == p){
-        // make sure the child isn't still in exit() or swtch().
         acquire(&pp->lock);
 
         havekids = 1;
         if(pp->state == ZOMBIE){
-          // Found one.
+          // Hijo terminado encontrado
           pid = pp->pid;
           if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
                                   sizeof(pp->xstate)) < 0) {
@@ -403,24 +400,29 @@ kwait(uint64 addr)
       }
     }
 
-    // No point waiting if we don't have any children.
+    // No hay hijos
     if(!havekids || killed(p)){
       release(&wait_lock);
       return -1;
     }
     
-    // Wait for a child to exit.
-    sleep(p, &wait_lock);  //DOC: wait-sleep
+    // Dormir esperando que un hijo termine
+    sleep(p, &wait_lock);
   }
 }
 
-// Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
+// ============================================================================
+// SCHEDULER - PLANIFICADOR ROUND-ROBIN
+// ============================================================================
+
+// scheduler() - Función principal del planificador
+// 
+// ALGORITMO: Round-Robin simple
+// - Recorre el arreglo proc[] buscando procesos RUNNABLE
+// - Ejecuta cada uno por un quantum de tiempo
+// - Si no hay procesos, ejecuta WFI para ahorrar energía
+//
+// CADA CPU ejecuta su propio scheduler() en loop infinito
 void
 scheduler(void)
 {
@@ -429,52 +431,64 @@ scheduler(void)
 
   c->proc = 0;
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+    // Habilitar interrupciones brevemente para evitar deadlock
+    // (dispositivos I/O necesitan despertar procesos)
     intr_on();
     intr_off();
 
     int found = 0;
+    
+    // Buscar proceso RUNNABLE (búsqueda O(n))
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
+      
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
+        // ¡Proceso ejecutable encontrado!
+        
+        // Cambiar estado: RUNNABLE → RUNNING
         p->state = RUNNING;
         c->proc = p;
+        
+        // CONTEXT SWITCH: saltar al proceso
+        // swtch() guarda contexto del scheduler y restaura el del proceso
+        // NO retorna inmediatamente, retorna cuando el proceso ceda la CPU
         swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
+        // El proceso terminó su quantum o se bloqueó
+        // Ya cambió su estado antes de volver aquí
         c->proc = 0;
         found = 1;
       }
+      
       release(&p->lock);
     }
+    
+    // Si no hay procesos RUNNABLE, dormir CPU con WFI
+    // (Wait For Interrupt - ahorra energía)
     if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
   }
 }
 
-// Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->noff, but that would
-// break in the few places where a lock is held but
-// there's no process.
+// ============================================================================
+// FUNCIONES DE CONTEXT SWITCHING
+// ============================================================================
+
+// sched() - Cede control al scheduler
+//
+// PRECONDICIONES:
+// - Debe tener p->lock held
+// - Solo UN lock held (noff == 1)
+// - Estado YA debe haber cambiado (no RUNNING)
+// - Interrupciones deshabilitadas
 void
 sched(void)
 {
   int intena;
   struct proc *p = myproc();
 
+  // Verificaciones de seguridad
   if(!holding(&p->lock))
     panic("sched p->lock");
   if(mycpu()->noff != 1)
@@ -484,24 +498,33 @@ sched(void)
   if(intr_get())
     panic("sched interruptible");
 
+  // Preservar estado de interrupciones
   intena = mycpu()->intena;
+  
+  // CONTEXT SWITCH al scheduler
   swtch(&p->context, &mycpu()->context);
+  
+  // Cuando retornemos (nos re-scheduleen), restaurar intena
   mycpu()->intena = intena;
 }
 
-// Give up the CPU for one scheduling round.
+// yield() - Cede voluntariamente la CPU
+//
+// Usado por:
+// - Timer interrupt (quantum expirado)
+// - Procesos cooperativos
+// - Spinlocks (mientras espera)
 void
 yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
-  sched();
+  p->state = RUNNABLE;  // Cambiar estado: RUNNING → RUNNABLE
+  sched();              // Ir al scheduler
   release(&p->lock);
 }
 
-// A fork child's very first scheduling by scheduler()
-// will swtch to forkret.
+// forkret() - Primera ejecución de un proceso hijo después de fork
 void
 forkret(void)
 {
@@ -509,67 +532,77 @@ forkret(void)
   static int first = 1;
   struct proc *p = myproc();
 
-  // Still holding p->lock from scheduler.
   release(&p->lock);
 
   if (first) {
-    // File system initialization must be run in the context of a
-    // regular process (e.g., because it calls sleep), and thus cannot
-    // be run from main().
+    // El primer proceso inicializa el filesystem
     fsinit(ROOTDEV);
 
     first = 0;
-    // ensure other cores see first=0.
     __sync_synchronize();
 
-    // We can invoke kexec() now that file system is initialized.
-    // Put the return value (argc) of kexec into a0.
+    // Ejecutar /init
     p->trapframe->a0 = kexec("/init", (char *[]){ "/init", 0 });
     if (p->trapframe->a0 == -1) {
       panic("exec");
     }
   }
 
-  // return to user space, mimicing usertrap()'s return.
+  // Retornar a user space
   prepare_return();
   uint64 satp = MAKE_SATP(p->pagetable);
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
   ((void (*)(uint64))trampoline_userret)(satp);
 }
 
-// Sleep on channel chan, releasing condition lock lk.
-// Re-acquires lk when awakened.
+// ============================================================================
+// SINCRONIZACIÓN: SLEEP/WAKEUP
+// ============================================================================
+
+// sleep() - Bloquea el proceso esperando un evento
+//
+// PARÁMETROS:
+// - chan: "canal" que identifica el evento (cualquier puntero)
+// - lk: lock de condición que debe liberarse al dormir
+//
+// PROTOCOLO:
+// 1. Caller adquiere lk
+// 2. Verifica condición
+// 3. Si no se cumple, llama sleep(chan, lk)
+// 4. sleep() libera lk y duerme
+// 5. Cuando wakeup(chan) se llama, sleep() retorna
+// 6. sleep() re-adquiere lk antes de retornar
 void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
   
-  // Must acquire p->lock in order to
-  // change p->state and then call sched.
-  // Once we hold p->lock, we can be
-  // guaranteed that we won't miss any wakeup
-  // (wakeup locks p->lock),
-  // so it's okay to release lk.
-
-  acquire(&p->lock);  //DOC: sleeplock1
+  // Adquirir p->lock antes de liberar lk
+  // Esto previene perder un wakeup
+  acquire(&p->lock);
   release(lk);
 
-  // Go to sleep.
+  // Dormir en el canal
   p->chan = chan;
   p->state = SLEEPING;
 
-  sched();
+  sched();  // Ir al scheduler
 
-  // Tidy up.
+  // Cuando despertemos, limpiar
   p->chan = 0;
 
-  // Reacquire original lock.
+  // Re-adquirir locks
   release(&p->lock);
   acquire(lk);
 }
 
-// Wake up all processes sleeping on channel chan.
-// Caller should hold the condition lock.
+// wakeup() - Despierta TODOS los procesos durmiendo en chan
+//
+// PARÁMETRO:
+// - chan: canal donde están durmiendo los procesos
+//
+// Busca en toda la tabla de procesos y cambia estado:
+// SLEEPING (con p->chan == chan) → RUNNABLE
 void
 wakeup(void *chan)
 {
@@ -579,16 +612,18 @@ wakeup(void *chan)
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
-        p->state = RUNNABLE;
+        p->state = RUNNABLE;  // Despertar proceso
       }
       release(&p->lock);
     }
   }
 }
 
-// Kill the process with the given pid.
-// The victim won't exit until it tries to return
-// to user space (see usertrap() in trap.c).
+// ============================================================================
+// OTRAS FUNCIONES
+// ============================================================================
+
+// kkill() - Mata un proceso por PID
 int
 kkill(int pid)
 {
@@ -599,8 +634,7 @@ kkill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       if(p->state == SLEEPING){
-        // Wake process from sleep().
-        p->state = RUNNABLE;
+        p->state = RUNNABLE;  // Despertar para que vea la señal
       }
       release(&p->lock);
       return 0;
@@ -629,9 +663,7 @@ killed(struct proc *p)
   return k;
 }
 
-// Copy to either a user address, or kernel address,
-// depending on usr_dst.
-// Returns 0 on success, -1 on error.
+// either_copyout() - Copia a dirección de usuario o kernel
 int
 either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
 {
@@ -644,9 +676,7 @@ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
   }
 }
 
-// Copy from either a user address, or kernel address,
-// depending on usr_src.
-// Returns 0 on success, -1 on error.
+// either_copyin() - Copia desde dirección de usuario o kernel
 int
 either_copyin(void *dst, int user_src, uint64 src, uint64 len)
 {
@@ -659,9 +689,7 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   }
 }
 
-// Print a process listing to console.  For debugging.
-// Runs when user types ^P on console.
-// No lock to avoid wedging a stuck machine further.
+// procdump() - Imprime lista de procesos (debugging)
 void
 procdump(void)
 {
